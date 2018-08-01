@@ -1,89 +1,91 @@
-const config = require('../config.js')
-const db = require('knex')(config.database)
-const bcrypt = require('bcrypt')
-const saltRounds = 10
-const randomstring = require('randomstring')
+const config = require('../config.js');
+const db = require('knex')(config.database);
+const bcrypt = require('bcrypt');
+const randomstring = require('randomstring');
+const utils = require('./utilsController.js');
 
-let authController = {}
+let authController = {};
 
-authController.verify = function(req, res, next){
-	
-	let username = req.body.username
-	let password = req.body.password
+authController.verify = async (req, res, next) => {
+	const username = req.body.username;
+	const password = req.body.password;
 
-	if(username === undefined) return res.json({ success: false, description: 'No username provided' })
-	if(password === undefined) return res.json({ success: false, description: 'No password provided' })
+	if (username === undefined) return res.json({ success: false, description: 'No username provided' });
+	if (password === undefined) return res.json({ success: false, description: 'No password provided' });
 
-	db.table('users').where('username', username).then((user) => {
-		if(user.length === 0) return res.json({ success: false, description: 'Username doesn\'t exist' })
+	const user = await db.table('users').where('username', username).first();
+	if (!user) return res.json({ success: false, description: 'Username doesn\'t exist' });
+	if (user.enabled === false || user.enabled === 0) return res.json({
+		success: false,
+		description: 'This account has been disabled'
+	});
 
-		bcrypt.compare(password, user[0].password, function(err, result) {
-			if(result === false) return res.json({ success: false, description: 'Wrong password' })
-			return res.json({ success: true, token: user[0].token })
-		})
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
+	bcrypt.compare(password, user.password, (err, result) => {
+		if (err) {
+			console.log(err);
+			return res.json({ success: false, description: 'There was an error' });
+		}
+		if (result === false) return res.json({ success: false, description: 'Wrong password' });
+		return res.json({ success: true, token: user.token });
+	});
+};
 
-}
+authController.register = async (req, res, next) => {
+	if (config.enableUserAccounts === false) {
+		return res.json({ success: false, description: 'Register is disabled at the moment' });
+	}
 
-authController.register = function(req, res, next){
+	const username = req.body.username;
+	const password = req.body.password;
 
-	if(config.enableUserAccounts === false) 
-		return res.json({ success: false, description: 'Register is disabled at the moment' })
+	if (username === undefined) return res.json({ success: false, description: 'No username provided' });
+	if (password === undefined) return res.json({ success: false, description: 'No password provided' });
 
-	let username = req.body.username
-	let password = req.body.password
+	if (username.length < 4 || username.length > 32) {
+		return res.json({ success: false, description: 'Username must have 4-32 characters' });
+	}
+	if (password.length < 6 || password.length > 64) {
+		return res.json({ success: false, description: 'Password must have 6-64 characters' });
+	}
 
-	if(username === undefined) return res.json({ success: false, description: 'No username provided' })
-	if(password === undefined) return res.json({ success: false, description: 'No password provided' })
+	const user = await db.table('users').where('username', username).first();
+	if (user) return res.json({ success: false, description: 'Username already exists' });
 
-	if(username.length < 4 || username.length > 32)
-		return res.json({ success: false, description: 'Username must have 4-32 characters' })
-	if(password.length < 6 || password.length > 64)
-		return res.json({ success: false, description: 'Password must have 6-64 characters' })
+	bcrypt.hash(password, 10, async (err, hash) => {
+		if (err) {
+			console.log(err);
+			return res.json({ success: false, description: 'Error generating password hash (╯°□°）╯︵ ┻━┻' });
+		}
+		const token = randomstring.generate(64);
+		await db.table('users').insert({
+			username: username,
+			password: hash,
+			token: token,
+			enabled: 1
+		});
+		return res.json({ success: true, token: token });
+	});
+};
 
-	db.table('users').where('username', username).then((user) => {
-		if(user.length !== 0) return res.json({ success: false, description: 'Username already exists' })
+authController.changePassword = async (req, res, next) => {
+	const user = await utils.authorize(req, res);
 
-		bcrypt.hash(password, saltRounds, function(err, hash) {
-			if(err) return res.json({ success: false, description: 'Error generating password hash (╯°□°）╯︵ ┻━┻' })
+	let password = req.body.password;
+	if (password === undefined) return res.json({ success: false, description: 'No password provided' });
 
-			let token = randomstring.generate(64)
+	if (password.length < 6 || password.length > 64) {
+		return res.json({ success: false, description: 'Password must have 6-64 characters' });
+	}
 
-			db.table('users').insert({
-				username: username,
-				password: hash,
-				token: token
-			}).then(() => {
-				return res.json({ success: true, token: token})
-			}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-		})
+	bcrypt.hash(password, 10, async (err, hash) => {
+		if (err) {
+			console.log(err);
+			return res.json({ success: false, description: 'Error generating password hash (╯°□°）╯︵ ┻━┻' });
+		}
 
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
+		await db.table('users').where('id', user.id).update({ password: hash });
+		return res.json({ success: true });
+	});
+};
 
-}
-
-authController.changePassword = function(req, res, next){
-
-	let token = req.headers.token
-	if(token === undefined) return res.status(401).json({ success: false, description: 'No token provided' })
-
-	db.table('users').where('token', token).then((user) => {
-		if(user.length === 0) return res.status(401).json({ success: false, description: 'Invalid token'})
-		
-		let password = req.body.password
-		if(password === undefined) return res.json({ success: false, description: 'No password provided' })
-		if(password.length < 6 || password.length > 64)
-			return res.json({ success: false, description: 'Password must have 6-64 characters' })
-
-		bcrypt.hash(password, saltRounds, function(err, hash) {
-			if(err) return res.json({ success: false, description: 'Error generating password hash (╯°□°）╯︵ ┻━┻' })
-
-			db.table('users').where('id', user[0].id).update({password: hash}).then(() => {
-				return res.json({ success: true})
-			}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-		})
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-
-}
-
-module.exports = authController
+module.exports = authController;

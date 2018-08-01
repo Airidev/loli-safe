@@ -1,333 +1,311 @@
-const path = require('path')
-const config = require('../config.js')
-const multer  = require('multer')
-const randomstring = require('randomstring')
-const db = require('knex')(config.database)
-const crypto = require('crypto')
-const fs = require('fs')
-const gm = require('gm')
-const ffmpeg = require('fluent-ffmpeg')
+const config = require('../config.js');
+const path = require('path');
+const multer = require('multer');
+const randomstring = require('randomstring');
+const db = require('knex')(config.database);
+const crypto = require('crypto');
+const fs = require('fs');
+const utils = require('./utilsController.js');
 
-let uploadsController = {}
+const uploadsController = {};
+
+// Let's default it to only 1 try
+const maxTries = config.uploads.maxTries || 1;
+const uploadDir = path.join(__dirname, '..', config.uploads.folder);
 
 const storage = multer.diskStorage({
-	destination: function (req, file, cb) {
-		cb(null, './' + config.uploads.folder + '/')
+	destination: function(req, file, cb) {
+		cb(null, uploadDir);
 	},
-	filename: function (req, file, cb) {
-		cb(null, randomstring.generate(config.uploads.fileLength) + path.extname(file.originalname))
+	filename: function(req, file, cb) {
+		const access = i => {
+			const name = randomstring.generate(config.uploads.fileLength) + path.extname(file.originalname);
+			fs.access(path.join(uploadDir, name), err => {
+				if (err) return cb(null, name);
+				console.log(`A file named "${name}" already exists (${++i}/${maxTries}).`);
+				if (i < maxTries) return access(i);
+				return cb('Could not allocate a unique file name. Try again?');
+			});
+		};
+		access(0);
 	}
-})
+});
 
 const upload = multer({
 	storage: storage,
-	limits: { fileSize: config.uploads.maxSize }
-}).array('files[]')
+	limits: { fileSize: config.uploads.maxSize },
+	fileFilter: function(req, file, cb) {
+		if (config.blockedExtensions !== undefined) {
+			if (config.blockedExtensions.some(extension => path.extname(file.originalname).toLowerCase() === extension)) {
+				return cb('This file extension is not allowed');
+			}
+			return cb(null, true);
+		}
+		return cb(null, true);
+	}
+}).array('files[]');
 
-uploadsController.upload = function(req, res, next){
+uploadsController.upload = async (req, res, next) => {
+	if (config.private === true) {
+		await utils.authorize(req, res);
+	}
 
-	// Get the token
-	let token = req.headers.token
+	const token = req.headers.token || '';
+	const user = await db.table('users').where('token', token).first();
+	if (user && (user.enabled === false || user.enabled === 0)) return res.json({
+		success: false,
+		description: 'This account has been disabled'
+	});
+	const albumid = req.headers.albumid || req.params.albumid;
 
-	// If we're running in private and there's no token, error
-	if(config.private === true)
-		if(token === undefined) return res.status(401).json({ success: false, description: 'No token provided' })
+	if (albumid && user) {
+		const album = await db.table('albums').where({ id: albumid, userid: user.id }).first();
+		if (!album) {
+			return res.json({
+				success: false,
+				description: 'Album doesn\'t exist or it doesn\'t belong to the user'
+			});
+		}
+		return uploadsController.actuallyUpload(req, res, user, albumid);
+	}
+	return uploadsController.actuallyUpload(req, res, user, albumid);
+};
 
-	// If there is no token then just leave it blank so the query fails
-	if(token === undefined) token = ''
-	
-	db.table('users').where('token', token).then((user) => {
-		let userid
-		if(user.length > 0)
-			userid = user[0].id
-
-		// Check if user is trying to upload to an album
-		let album = undefined
-		if(userid !== undefined){
-			album = req.headers.albumid
-			if(album === undefined)
-				album = req.params.albumid
+uploadsController.actuallyUpload = async (req, res, userid, albumid) => {
+	upload(req, res, async err => {
+		if (err) {
+			console.error(err);
+			return res.json({ success: false, description: err });
 		}
 
-		upload(req, res, function (err) {
-			if (err) {
-				console.error(err)
-				return res.json({ 
-					success: false,
-					description: err
-				})
-			}
+		if (req.files.length === 0) return res.json({ success: false, description: 'no-files' });
 
-			if(req.files.length === 0) return res.json({ success: false, description: 'no-files' })
+		const files = [];
+		const existingFiles = [];
+		let iteration = 1;
 
-			let files = []
-			let existingFiles = []
-			let iteration = 1
+		req.files.forEach(async file => {
+			// Check if the file exists by checking hash and size
+			let hash = crypto.createHash('md5');
+			let stream = fs.createReadStream(path.join(__dirname, '..', config.uploads.folder, file.filename));
 
-			req.files.forEach(function(file) {
+			stream.on('data', data => {
+				hash.update(data, 'utf8');
+			});
 
-				// Check if the file exists by checking hash and size
-				let hash = crypto.createHash('md5')
-				let stream = fs.createReadStream('./' + config.uploads.folder + '/' + file.filename)
-
-				stream.on('data', function (data) {
-					hash.update(data, 'utf8')
-				})
-
-				stream.on('end', function () {
-					let fileHash = hash.digest('hex') // 34f7a3113803f8ed3b8fd7ce5656ebec
-
-					db.table('files')
-					.where(function(){
-						if(userid === undefined) 
-							this.whereNull('userid')
-						else 
-							this.where('userid', userid)
+			stream.on('end', async () => {
+				const fileHash = hash.digest('hex');
+				const dbFile = await db.table('files')
+					.where(function() {
+						if (userid === undefined) this.whereNull('userid');
+						else this.where('userid', userid.id);
 					})
 					.where({
 						hash: fileHash,
 						size: file.size
-					}).then((dbfile) => {
+					})
+					.first();
 
-						if(dbfile.length !== 0){
-							uploadsController.deleteFile(file.filename).then(() => {}).catch((e) => console.error(e))
-							existingFiles.push(dbfile[0])
-						}else{
-							files.push({
-								name: file.filename, 
-								original: file.originalname,
-								type: file.mimetype,
-								size: file.size, 
-								hash: fileHash,
-								ip: req.ip,
-								albumid: album,
-								userid: userid,
-								timestamp: Math.floor(Date.now() / 1000)
-							})
-						}
+				if (!dbFile) {
+					files.push({
+						name: file.filename,
+						original: file.originalname,
+						type: file.mimetype,
+						size: file.size,
+						hash: fileHash,
+						ip: req.ip,
+						albumid: albumid,
+						userid: userid !== undefined ? userid.id : null,
+						timestamp: Math.floor(Date.now() / 1000)
+					});
+				} else {
+					uploadsController.deleteFile(file.filename).then(() => {}).catch(err => console.error(err));
+					existingFiles.push(dbFile);
+				}
 
-						if(iteration === req.files.length)
-							return uploadsController.processFilesForDisplay(req, res, files, existingFiles)
-						iteration++
+				if (iteration === req.files.length) {
+					return uploadsController.processFilesForDisplay(req, res, files, existingFiles, albumid);
+				}
+				iteration++;
+			});
+		});
+	});
+};
 
-					}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-				})
-			})
-		})
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-}
-
-uploadsController.processFilesForDisplay = function(req, res, files, existingFiles){
-
-	let basedomain = req.get('host')
-	for(let domain of config.domains)
-		if(domain.host === req.get('host'))
-			if(domain.hasOwnProperty('resolve'))
-				basedomain = domain.resolve
-
-	if(files.length === 0){
+uploadsController.processFilesForDisplay = async (req, res, files, existingFiles, albumid) => {
+	let basedomain = config.domain;
+	if (files.length === 0) {
 		return res.json({
 			success: true,
 			files: existingFiles.map(file => {
 				return {
 					name: file.name,
 					size: file.size,
-					url: basedomain + '/' + file.name
-				}
+					url: `${basedomain}/${file.name}`
+				};
 			})
-		})
+		});
 	}
 
-	db.table('files').insert(files).then(() => {
+	await db.table('files').insert(files);
+	for (let efile of existingFiles) files.push(efile);
 
-		for(let efile of existingFiles) files.push(efile)
+	for (let file of files) {
+		let ext = path.extname(file.name).toLowerCase();
+		if (utils.imageExtensions.includes(ext) || utils.videoExtensions.includes(ext)) {
+			file.thumb = `${basedomain}/thumbs/${file.name.slice(0, -ext.length)}.png`;
+			utils.generateThumbs(file);
+		}
+	}
 
-		res.json({
-			success: true,
-			files: files.map(file => {
-				return {
-					name: file.name,
-					size: file.size,
-					url: basedomain + '/' + file.name
-				}
-			})
+	let albumSuccess = true;
+	if (albumid) {
+		const editedAt = Math.floor(Date.now() / 1000)
+		albumSuccess = await db.table('albums')
+			.where('id', albumid)
+			.update('editedAt', editedAt)
+			.then(() => true)
+			.catch(error => {
+				console.log(error);
+				return false;
+			});
+	}
+
+	return res.json({
+		success: albumSuccess,
+		description: albumSuccess ? null : 'Warning: Error updating album.',
+		files: files.map(file => {
+			return {
+				name: file.name,
+				size: file.size,
+				url: `${basedomain}/${file.name}`
+			};
 		})
+	});
+};
 
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-}
+uploadsController.delete = async (req, res) => {
+	const user = await utils.authorize(req, res);
+	const id = req.body.id;
+	if (id === undefined || id === '') {
+		return res.json({ success: false, description: 'No file specified' });
+	}
 
-uploadsController.delete = function(req, res){
-
-	let token = req.headers.token
-	if(token === undefined) return res.status(401).json({ success: false, description: 'No token provided' })
-
-	let id = req.body.id
-	if(id === undefined || id === '')
-		return res.json({ success: false, description: 'No file specified' })
-
-	db.table('users').where('token', token).then((user) => {
-		if(user.length === 0) return res.status(401).json({ success: false, description: 'Invalid token'})
-
-		db.table('files')
+	const file = await db.table('files')
 		.where('id', id)
-		.where(function(){
-			if(user[0].username !== 'root')
-				this.where('userid', user[0].id)
+		.where(function() {
+			if (user.username !== 'root') {
+				this.where('userid', user.id);
+			}
 		})
-		.then((file) => {
+		.first();
 
-			uploadsController.deleteFile(file[0].name).then(() => {
-				db.table('files').where('id', id).del().then(() =>{
-					return res.json({ success: true })
-				}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-			}).catch((e) => {
-				console.log(e.toString())
-				db.table('files').where('id', id).del().then(() =>{
-					return res.json({ success: true })
-				}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-			})
+	try {
+		await uploadsController.deleteFile(file.name);
+		await db.table('files').where('id', id).del();
+		if (file.albumid) {
+			await db.table('albums').where('id', file.albumid).update('editedAt', Math.floor(Date.now() / 1000));
+		}
+	} catch (err) {
+		console.log(err);
+	}
 
-		}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-	}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
+	return res.json({ success: true });
+};
 
-}
+uploadsController.deleteFile = function(file) {
+	const ext = path.extname(file).toLowerCase();
+	return new Promise((resolve, reject) => {
+		fs.stat(path.join(__dirname, '..', config.uploads.folder, file), (err, stats) => {
+			if (err) { return reject(err); }
+			fs.unlink(path.join(__dirname, '..', config.uploads.folder, file), err => {
+				if (err) { return reject(err); }
+				if (!utils.imageExtensions.includes(ext) && !utils.videoExtensions.includes(ext)) {
+					return resolve();
+				}
+				file = file.substr(0, file.lastIndexOf('.')) + '.png';
+				fs.stat(path.join(__dirname, '..', config.uploads.folder, 'thumbs/', file), (err, stats) => {
+					if (err) {
+						console.log(err);
+						return resolve();
+					}
+					fs.unlink(path.join(__dirname, '..', config.uploads.folder, 'thumbs/', file), err => {
+						if (err) { return reject(err); }
+						return resolve();
+					});
+				});
+			});
+		});
+	});
+};
 
-uploadsController.deleteFile = function(file){
+uploadsController.list = async (req, res) => {
+	const user = await utils.authorize(req, res);
 
-	return new Promise(function(resolve, reject){
-		fs.stat('./' + config.uploads.folder + '/' + file, function (err, stats) {
-			if (err) { return reject(err) }
-			fs.unlink('./' + config.uploads.folder + '/' + file, function(err){
-				if (err) { return reject(err) }
-				return resolve()
-			})
+	let offset = req.params.page;
+	if (offset === undefined) offset = 0;
+
+	const files = await db.table('files')
+		.where(function() {
+			if (req.params.id === undefined) this.where('id', '<>', '');
+			else this.where('albumid', req.params.id);
 		})
-	})
-
-}
-
-uploadsController.list = function(req, res){
-
-	let token = req.headers.token
-	if(token === undefined) return res.status(401).json({ success: false, description: 'No token provided' })
-
-	db.table('users').where('token', token).then((user) => {
-		if(user.length === 0) return res.status(401).json({ success: false, description: 'Invalid token'})
-
-		let offset = req.params.page
-		if(offset === undefined) offset = 0
-
-		db.table('files')
-		.where(function(){
-			if(req.params.id === undefined)
-				this.where('id', '<>', '')
-			else
-				this.where('albumid', req.params.id)
-		})
-		.where(function(){
-			if(user[0].username !== 'root')
-				this.where('userid', user[0].id)
+		.where(function() {
+			if (user.username !== 'root') this.where('userid', user.id);
 		})
 		.orderBy('id', 'DESC')
 		.limit(25)
 		.offset(25 * offset)
-		.select('id', 'albumid', 'timestamp', 'name', 'userid')
-		.then((files) => {
-			db.table('albums').then((albums) => {
+		.select('id', 'albumid', 'timestamp', 'name', 'userid');
 
-				let basedomain = req.get('host')
-				for(let domain of config.domains)
-					if(domain.host === req.get('host'))
-						if(domain.hasOwnProperty('resolve'))
-							basedomain = domain.resolve
+	const albums = await db.table('albums');
+	let basedomain = config.domain;
+	let userids = [];
 
-				let userids = []
+	for (let file of files) {
+		file.file = `${basedomain}/${file.name}`;
+		file.date = new Date(file.timestamp * 1000);
+		file.date = utils.getPrettyDate(file.date);
 
-				for(let file of files){
-					file.file = basedomain + '/' + file.name
-					file.date = new Date(file.timestamp * 1000)
-					file.date = file.date.getFullYear() + '-' + (file.date.getMonth() + 1) + '-' + file.date.getDate() + ' ' + (file.date.getHours() < 10 ? '0' : '') + file.date.getHours() + ':' + (file.date.getMinutes() < 10 ? '0' : '') + file.date.getMinutes() + ':' + (file.date.getSeconds() < 10 ? '0' : '') + file.date.getSeconds()
+		file.album = '';
 
-					file.album = ''
-					
-					if(file.albumid !== undefined)
-						for(let album of albums)
-							if(file.albumid === album.id)
-								file.album = album.name
-
-					// Only push usernames if we are root
-					if(user[0].username === 'root')
-						if(file.userid !== undefined && file.userid !== null && file.userid !== '')
-							userids.push(file.userid)
-
-					uploadsController.generateThumbs(file, basedomain)
+		if (file.albumid !== undefined) {
+			for (let album of albums) {
+				if (file.albumid === album.id) {
+					file.album = album.name;
 				}
+			}
+		}
 
-				// If we are a normal user, send response
-				if(user[0].username !== 'root') return res.json({ success: true, files })
+		// Only push usernames if we are root
+		if (user.username === 'root') {
+			if (file.userid !== undefined && file.userid !== null && file.userid !== '') {
+				userids.push(file.userid);
+			}
+		}
 
-				// If we are root but there are no uploads attached to a user, send response
-				if(userids.length === 0) return res.json({ success: true, files })
-				
-				db.table('users').whereIn('id', userids).then((users) => {
-					for(let user of users)
-						for(let file of files)
-							if(file.userid === user.id)
-								file.username = user.username
-
-					return res.json({ success: true, files })
-				}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-			}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-		}).catch(function(error) { console.log(error); res.json({success: false, description: 'error'}) })
-
-	})	
-}
-
-uploadsController.generateThumbs = function(file, basedomain){
-	if(config.uploads.generateThumbnails !== true) return
-
-	let extensions = ['.jpg', '.jpeg', '.bmp', '.gif', '.png', '.webm', '.mp4']
-	for(let ext of extensions){
-		if(path.extname(file.name).toLowerCase() === ext){
-
-			file.thumb = basedomain + '/thumbs/' + file.name.slice(0, -ext.length) + '.png'
-
-			let thumbname = path.join(__dirname, '..', config.uploads.folder, 'thumbs') + '/' + file.name.slice(0, -ext.length) + '.png'
-			fs.access(thumbname, function(err) {
-				if (err && err.code === 'ENOENT') {
-					// File doesnt exist
-
-					if (ext === '.webm' || ext === '.mp4') {
-						ffmpeg('./' + config.uploads.folder + '/' + file.name)
-							.thumbnail({
-								timestamps: [0],
-								filename: '%b.png',
-								folder: './' + config.uploads.folder + '/thumbs',
-								size: '200x?'
-							})
-							.on('error', function(error) {
-								console.log('Error - ', error.message)
-							})
-					}
-					else {
-						let size = {
-							width: 200,
-							height: 200
-						}
-
-						gm('./' + config.uploads.folder + '/' + file.name)
-							.resize(size.width, size.height + '>')
-							.gravity('Center')
-							.extent(size.width, size.height)
-							.background('transparent')
-							.write(thumbname, function (error) {
-								if (error) console.log('Error - ', error)
-							})
-					}
-				}
-			})
+		let ext = path.extname(file.name).toLowerCase();
+		if (utils.imageExtensions.includes(ext) || utils.videoExtensions.includes(ext)) {
+			file.thumb = `${basedomain}/thumbs/${file.name.slice(0, -ext.length)}.png`;
 		}
 	}
-}
 
-module.exports = uploadsController
+	// If we are a normal user, send response
+	if (user.username !== 'root') return res.json({ success: true, files });
+
+	// If we are root but there are no uploads attached to a user, send response
+	if (userids.length === 0) return res.json({ success: true, files });
+
+	const users = await db.table('users').whereIn('id', userids);
+	for (let dbUser of users) {
+		for (let file of files) {
+			if (file.userid === dbUser.id) {
+				file.username = dbUser.username;
+			}
+		}
+	}
+
+	return res.json({ success: true, files });
+};
+
+module.exports = uploadsController;
